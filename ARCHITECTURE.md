@@ -55,6 +55,8 @@ Manifest validates interfaces, configuration, permissions, dependencies, version
 
 Explicit module assembly creates product.json, package.json, tsconfig and source workspace; this is not represented as AI generation. Real model tasks persist input, plan, tool arguments/results, files, failures and final status. Model/tool budgets cap work. File operations are scoped to owner workspace, deny traversal/symlinks/secrets and impose quotas. Untrusted README or module metadata cannot grant tool privileges. Freeform TypeScript is stored but only compiled/tested/executed in Docker. Without credentials, a job is durably BLOCKED, never mocked as successful.
 
+Agent Switch converts bounded failure into an audited in-job handoff. Repeated tool failures, retryable provider errors, or an exhausted attempt budget can start a fresh recovery context while preserving the same project, job and validation invariants. Recovery is capped, recorded in `job_events`, and may use an optional fallback model. See `docs/AGENT_SWITCH.md`.
+
 ## Deployment and recovery
 
 Project lifecycle migration `control/003_project_lifecycle.sql` adds reversible deletion. Normal project and deployment lists exclude trashed projects. Archive marks the project unavailable, cancels its jobs and stops active instances under the application lock; errors restore its active status. Restore uses the same lock and leaves processes stopped. Per-account row locks serialize creation/restoration against the 20-active/100-retained quotas. Files, application databases, encrypted configuration and deployment history remain available after restoration. These are single-control-process lifecycle locks, not a distributed-worker lease.
