@@ -430,22 +430,7 @@ export class Deployments {
         await this.log(id, result.stdout + result.stderr);
         if (!result.ok) throw new Error("Container failed to start");
       }
-      let healthy = false;
-      for (let attempt = 0; attempt < 45; attempt++) {
-        try {
-          const r = await fetch(`http://127.0.0.1:${port}/api/health`, {
-            signal: AbortSignal.timeout(1000),
-          });
-          const body = (await r.json()) as { appId: string };
-          if (r.ok && body.appId === app.id) {
-            healthy = true;
-            break;
-          }
-        } catch {
-          /* Startup health probes retry until the bounded deadline. */
-        }
-        await delay(300);
-      }
+      const healthy = await this.waitForHealth(id, app.id, port);
       if (!healthy) throw new Error("Health check failed");
       await this.projects.db.query(
         "UPDATE deployments SET status='running',updated_at=now() WHERE id=$1",
@@ -523,6 +508,29 @@ export class Deployments {
     } catch {
       return false;
     }
+  }
+  /**
+   * Cold-start budget. A freshly assembled application boots its own PostgreSQL
+   * cluster and then mounts the shared module runtime; measured cold starts on a
+   * developer laptop sit around 13-16s, which the old fixed 45x300ms budget
+   * (13.5s) could not cover - a perfectly healthy runtime was therefore reported
+   * as `Health check failed`. The wait is deadline based now, and it gives up
+   * early only when the runtime process is already gone.
+   */
+  private async waitForHealth(
+    id: string,
+    appId: string,
+    port: number,
+    timeoutMs = 90_000,
+  ) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (await this.probe(appId, port)) return true;
+      const child = this.processes.get(id);
+      if (child && child.exitCode !== null) return false;
+      await delay(300);
+    }
+    return false;
   }
   async start(id: string, actor: string) {
     const row = await this.get(id, actor);
@@ -617,14 +625,7 @@ export class Deployments {
         [id, child.pid ?? null],
       );
     }
-    let healthy = false;
-    for (let attempt = 0; attempt < 45; attempt++) {
-      if (await this.probe(row.app_id, row.port)) {
-        healthy = true;
-        break;
-      }
-      await delay(300);
-    }
+    const healthy = await this.waitForHealth(id, row.app_id, row.port, 60_000);
     if (!healthy) {
       await this.terminate(id, row.provider);
       await this.projects.db.query(
