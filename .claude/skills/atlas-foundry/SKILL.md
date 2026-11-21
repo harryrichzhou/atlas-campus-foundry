@@ -56,13 +56,18 @@ Invoke-RestMethod http://127.0.0.1:3000/api/auth/login -Method Post `
 GET    /api/system/llm
 # 写入 / 覆盖（仅 admin）
 PUT    /api/system/llm    {"baseUrl":"https://api.deepseek.com/v1","model":"deepseek-chat","apiKey":"sk-..."}
+# 带备用模型（Agent 切换用；apiKey 可省略＝继承主 key）
+PUT    /api/system/llm    {"baseUrl":"https://api.deepseek.com/v1","model":"deepseek-chat","apiKey":"sk-...","fallback":{"model":"deepseek-v4-pro"}}
 # 连通性探测（仅 admin）：返回 ok / stage / code / latencyMs，不泄露 key
-POST   /api/system/llm/test   {}
-# 清除（仅 admin）：回落到 .env 的值
+POST   /api/system/llm/test   {"target":"primary"}   # 或 {"target":"fallback"}；空 body 等同 primary
+# 清除（仅 admin）：主模型与备用模型一起回落到 .env 的值
 DELETE /api/system/llm
 ```
 
-响应形状：`{configured, model, baseUrl, apiKeyPresent, source}`，`source` 为 `platform-settings` 或 `environment`。
+响应形状：`{configured, model, baseUrl, apiKeyPresent, source, fallback:{configured, model, baseUrl, apiKeyPresent, inheritsApiKey, source}}`，`source` 为 `platform-settings` 或 `environment`。
+
+- `fallback` 写入后落到 `LLM_FALLBACK_MODEL` / `LLM_FALLBACK_BASE_URL` / `LLM_FALLBACK_API_KEY`，`server/agent.ts` 的 `endpointPlan()` 用它作为 `recovery` 端点；不传 `fallback` 再 PUT 一次会把备用端点清空（不会复活 `.env` 里的旧 fallback）。
+- 探测失败多一个 `code`：`LLM_FALLBACK_UNCONFIGURED`（没配备用模型）。
 
 - key 以 AES-256-GCM 加密存 `platform_settings.value`，密钥文件 `.data/vault.key`（0600）。任何接口都不回显 key。
 - 远程端点强制 HTTPS；`127.0.0.1`/`localhost`/`::1` 可用 http。

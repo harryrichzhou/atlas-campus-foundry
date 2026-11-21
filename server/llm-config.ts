@@ -17,6 +17,34 @@ import { decryptSecret, encryptSecret } from "./vault.js";
  */
 export const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 
+/**
+ * Optional recovery endpoint used by the Agent switch (see `endpointPlan` in
+ * server/agent.ts). It lives here rather than in `.env` so an operator can
+ * rotate both endpoints from one place and keep the key encrypted at rest:
+ * `apiKey` may be omitted, in which case the primary key is inherited.
+ */
+export const llmFallbackSchema = z.object({
+  baseUrl: z
+    .string()
+    .trim()
+    .max(400)
+    .optional()
+    .transform((value) => (value ? value : undefined)),
+  model: z
+    .string()
+    .trim()
+    .max(120)
+    .optional()
+    .transform((value) => (value ? value : undefined)),
+  apiKey: z
+    .string()
+    .trim()
+    .max(400)
+    .optional()
+    .transform((value) => (value ? value : undefined)),
+});
+export type LlmFallbackInput = z.infer<typeof llmFallbackSchema>;
+
 export const llmConfigSchema = z.object({
   baseUrl: z
     .string()
@@ -25,14 +53,30 @@ export const llmConfigSchema = z.object({
     .default(() => process.env.LLM_BASE_URL || DEFAULT_BASE_URL),
   model: z.string().trim().min(1, "model 不能为空").max(120),
   apiKey: z.string().trim().min(8, "apiKey 至少 8 个字符").max(400),
+  fallback: llmFallbackSchema.optional(),
 });
-export type LlmConfig = { baseUrl: string; model: string; apiKey: string };
+export type LlmFallback = {
+  model: string;
+  baseUrl: string;
+  /** null means "inherit the primary key". */
+  apiKey: string | null;
+};
+export type LlmConfig = {
+  baseUrl: string;
+  model: string;
+  apiKey: string;
+  fallback: LlmFallback | null;
+};
+export type LlmTarget = "primary" | "fallback";
 
 const SETTING_KEY = "llm";
 const baseline = {
   apiKey: process.env.LLM_API_KEY,
   model: process.env.LLM_MODEL,
   baseUrl: process.env.LLM_BASE_URL,
+  fallbackApiKey: process.env.LLM_FALLBACK_API_KEY,
+  fallbackModel: process.env.LLM_FALLBACK_MODEL,
+  fallbackBaseUrl: process.env.LLM_FALLBACK_BASE_URL,
 };
 let source: "platform-settings" | "environment" = "environment";
 
@@ -57,6 +101,20 @@ export function llmStatus() {
     // Never echo the key: only whether one is present and where it came from.
     apiKeyPresent: Boolean(process.env.LLM_API_KEY),
     source,
+    /** Recovery endpoint for the Agent switch; absent when not configured. */
+    fallback: {
+      configured: Boolean(process.env.LLM_FALLBACK_MODEL),
+      model: process.env.LLM_FALLBACK_MODEL || null,
+      baseUrl:
+        process.env.LLM_FALLBACK_BASE_URL ||
+        process.env.LLM_BASE_URL ||
+        DEFAULT_BASE_URL,
+      apiKeyPresent: Boolean(
+        process.env.LLM_FALLBACK_API_KEY || process.env.LLM_API_KEY,
+      ),
+      inheritsApiKey: !process.env.LLM_FALLBACK_API_KEY,
+      source,
+    },
   };
 }
 
@@ -64,6 +122,19 @@ function apply(config: LlmConfig) {
   process.env.LLM_API_KEY = config.apiKey;
   process.env.LLM_MODEL = config.model;
   process.env.LLM_BASE_URL = config.baseUrl;
+  if (config.fallback) {
+    process.env.LLM_FALLBACK_MODEL = config.fallback.model;
+    process.env.LLM_FALLBACK_BASE_URL = config.fallback.baseUrl;
+    if (config.fallback.apiKey)
+      process.env.LLM_FALLBACK_API_KEY = config.fallback.apiKey;
+    else delete process.env.LLM_FALLBACK_API_KEY;
+  } else {
+    // A stored primary config without a fallback must not resurrect a `.env`
+    // fallback the operator just removed from the platform settings.
+    delete process.env.LLM_FALLBACK_MODEL;
+    delete process.env.LLM_FALLBACK_BASE_URL;
+    delete process.env.LLM_FALLBACK_API_KEY;
+  }
   source = "platform-settings";
 }
 
@@ -75,6 +146,9 @@ function restoreBaseline() {
   set("LLM_API_KEY", baseline.apiKey);
   set("LLM_MODEL", baseline.model);
   set("LLM_BASE_URL", baseline.baseUrl);
+  set("LLM_FALLBACK_API_KEY", baseline.fallbackApiKey);
+  set("LLM_FALLBACK_MODEL", baseline.fallbackModel);
+  set("LLM_FALLBACK_BASE_URL", baseline.fallbackBaseUrl);
   source = "environment";
 }
 
@@ -84,15 +158,31 @@ export async function readLlmConfig(
 ): Promise<LlmConfig | null> {
   const row = (
     await db.query<{
-      value: { baseUrl?: string; model?: string; apiKey?: string };
+      value: {
+        baseUrl?: string;
+        model?: string;
+        apiKey?: string;
+        fallback?: { baseUrl?: string; model?: string; apiKey?: string };
+      };
     }>("SELECT value FROM platform_settings WHERE key=$1", [SETTING_KEY])
   ).rows[0];
   const value = row?.value;
   if (!value?.apiKey || !value.model) return null;
+  const storedFallback = value.fallback;
   return {
     apiKey: await decryptSecret(root, value.apiKey),
     model: value.model,
     baseUrl: value.baseUrl || DEFAULT_BASE_URL,
+    fallback:
+      storedFallback?.model && storedFallback.baseUrl
+        ? {
+            model: storedFallback.model,
+            baseUrl: storedFallback.baseUrl,
+            apiKey: storedFallback.apiKey
+              ? await decryptSecret(root, storedFallback.apiKey)
+              : null,
+          }
+        : null,
   };
 }
 
@@ -114,12 +204,34 @@ export async function saveLlmConfig(
     apiKey: parsed.apiKey,
     model: parsed.model,
     baseUrl: normalizeBaseUrl(parsed.baseUrl),
+    fallback: parsed.fallback?.model
+      ? {
+          model: parsed.fallback.model,
+          baseUrl: normalizeBaseUrl(
+            parsed.fallback.baseUrl || parsed.baseUrl || DEFAULT_BASE_URL,
+          ),
+          apiKey: parsed.fallback.apiKey || null,
+        }
+      : null,
   };
-  const stored = {
+  const stored: {
+    baseUrl: string;
+    model: string;
+    apiKey: string;
+    fallback?: { baseUrl: string; model: string; apiKey?: string };
+  } = {
     baseUrl: config.baseUrl,
     model: config.model,
     apiKey: await encryptSecret(root, config.apiKey),
   };
+  if (config.fallback)
+    stored.fallback = {
+      baseUrl: config.fallback.baseUrl,
+      model: config.fallback.model,
+      ...(config.fallback.apiKey
+        ? { apiKey: await encryptSecret(root, config.fallback.apiKey) }
+        : {}),
+    };
   await db.query(
     `INSERT INTO platform_settings(key,value,updated_by,updated_at)
      VALUES($1,$2,$3,now())
@@ -141,16 +253,30 @@ export async function clearLlmConfig(db: Database) {
  * endpoint. Returns a diagnosis instead of throwing so the caller can show the
  * exact failure (bad key, wrong model name, blocked egress, ...).
  */
-export async function probeLlm(timeoutMs = 25000) {
-  const key = process.env.LLM_API_KEY,
-    model = process.env.LLM_MODEL,
-    baseUrl = process.env.LLM_BASE_URL || DEFAULT_BASE_URL;
+export async function probeLlm(
+  timeoutMs = 25000,
+  target: LlmTarget = "primary",
+) {
+  const recovery = target === "fallback";
+  const key = recovery
+    ? process.env.LLM_FALLBACK_API_KEY || process.env.LLM_API_KEY
+    : process.env.LLM_API_KEY;
+  const model = recovery
+    ? process.env.LLM_FALLBACK_MODEL
+    : process.env.LLM_MODEL;
+  const baseUrl =
+    (recovery
+      ? process.env.LLM_FALLBACK_BASE_URL || process.env.LLM_BASE_URL
+      : process.env.LLM_BASE_URL) || DEFAULT_BASE_URL;
   if (!key || !model)
     return {
       ok: false,
+      target,
       stage: "config" as const,
-      code: "LLM_UNCONFIGURED",
-      message: "尚未配置 LLM_API_KEY / LLM_MODEL",
+      code: recovery ? "LLM_FALLBACK_UNCONFIGURED" : "LLM_UNCONFIGURED",
+      message: recovery
+        ? "尚未配置备用模型（LLM_FALLBACK_MODEL）"
+        : "尚未配置 LLM_API_KEY / LLM_MODEL",
     };
   const started = Date.now();
   try {
@@ -182,6 +308,7 @@ export async function probeLlm(timeoutMs = 25000) {
               : "上游返回错误";
       return {
         ok: false,
+        target,
         stage: "provider" as const,
         code: `HTTP_${response.status}`,
         httpStatus: response.status,
@@ -197,6 +324,7 @@ export async function probeLlm(timeoutMs = 25000) {
     };
     return {
       ok: true,
+      target,
       stage: "done" as const,
       code: "OK",
       latencyMs,
@@ -208,6 +336,7 @@ export async function probeLlm(timeoutMs = 25000) {
   } catch (error) {
     return {
       ok: false,
+      target,
       stage: "transport" as const,
       code: (error as NodeJS.ErrnoException).name === "TimeoutError" ? "LLM_TIMEOUT" : "LLM_UNREACHABLE",
       latencyMs: Date.now() - started,

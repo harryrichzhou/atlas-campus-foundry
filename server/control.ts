@@ -120,6 +120,11 @@ export async function createControl(
     await projects.audit(user.id, "system.llm_configured", "llm", {
       model: status.model,
       baseUrl: status.baseUrl,
+      fallbackModel: status.fallback.model,
+      fallbackBaseUrl: status.fallback.configured
+        ? status.fallback.baseUrl
+        : null,
+      fallbackInheritsApiKey: status.fallback.inheritsApiKey,
     });
     return status;
   });
@@ -131,8 +136,12 @@ export async function createControl(
   });
   app.post("/api/system/llm/test", async (request) => {
     const user = requireAdmin(requireUser(request));
-    const result = await probeLlm();
+    const { target } = z
+      .object({ target: z.enum(["primary", "fallback"]).default("primary") })
+      .parse(request.body ?? {});
+    const result = await probeLlm(25000, target);
     await projects.audit(user.id, "system.llm_probe", "llm", {
+      target,
       ok: result.ok,
       code: result.code,
       latencyMs: "latencyMs" in result ? result.latencyMs : null,
