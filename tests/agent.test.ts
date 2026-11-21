@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { createControl } from "../server/control.js";
 import { Agent, type LlmProvider, type LlmMessage } from "../server/agent.js";
+import { AppError } from "../packages/contracts/src/index.js";
 
 class ScriptedContractProvider implements LlmProvider {
   constructor(private replies: LlmMessage[]) {}
@@ -100,6 +101,146 @@ test("Agent contract-only provider: real tools, durable trace, stale preview rej
       )
     ).rows[0];
     assert.match(stored.error, /Repair budget exhausted/);
+    const switched = await queued("Recover the same job with a fresh Agent");
+    const switchable = new Agent(
+      c.projects,
+      c.deployments,
+      new ScriptedContractProvider([
+        call("execShell", { command: "whoami" }),
+        call("readProjectFiles", { path: "../outside" }),
+        call("createPreview", {}),
+        { role: "assistant", content: "Recovered after handoff" },
+      ]),
+      { maxSwitches: 1 },
+    );
+    await switchable.run(switched);
+    const switchedJob = await switchable.get(switched, user.id);
+    assert.equal(switchedJob.status, "succeeded");
+    assert.equal(switchedJob.switch_count, 1);
+    assert.equal(switchedJob.current_agent, "repair-1");
+    const handoffs = (
+      await c.db.query<{ payload: { reason: string; to: string } }>(
+        "SELECT payload FROM job_events WHERE job_id=$1 AND type='agent_switch'",
+        [switched],
+      )
+    ).rows;
+    assert.equal(handoffs.length, 1);
+    assert.equal(handoffs[0].payload.reason, "consecutive_tool_failures");
+    assert.equal(handoffs[0].payload.to, "repair-1");
+    const attempts = (
+      await c.db.query<{ attempt: number; status: string }>(
+        "SELECT attempt,status FROM agent_attempts WHERE job_id=$1 ORDER BY attempt",
+        [switched],
+      )
+    ).rows;
+    assert.deepEqual(attempts, [
+      { attempt: 0, status: "switched" },
+      { attempt: 1, status: "succeeded" },
+    ]);
+    const repeatedFailure = await queued(
+      "Recover when the same failure repeats around a successful inspection",
+    );
+    let repeatedStep = 0,
+      handoffWasValidJson = false;
+    const repeatedAgent = new Agent(
+      c.projects,
+      c.deployments,
+      {
+        async complete(messages) {
+          if (repeatedStep++ === 0)
+            return call("execShell", { command: "whoami" });
+          if (repeatedStep === 2)
+            return call("searchModules", { query: "events" });
+          if (repeatedStep === 3)
+            return call("execShell", { command: "whoami" });
+          if (repeatedStep === 4) {
+            const handoff = messages
+              .at(-1)
+              ?.content?.split("\n")
+              .slice(1)
+              .join("\n");
+            assert.ok(handoff);
+            JSON.parse(handoff);
+            handoffWasValidJson = true;
+            return call("createPreview", {});
+          }
+          return { role: "assistant", content: "Recovered repeated failure" };
+        },
+      },
+      { maxSwitches: 1 },
+    );
+    await repeatedAgent.run(repeatedFailure);
+    assert.equal(
+      (await repeatedAgent.get(repeatedFailure, user.id)).status,
+      "succeeded",
+    );
+    assert.equal(handoffWasValidJson, true);
+    const repeatedHandoff = (
+      await c.db.query<{ payload: { reason: string } }>(
+        "SELECT payload FROM job_events WHERE job_id=$1 AND type='agent_switch'",
+        [repeatedFailure],
+      )
+    ).rows;
+    assert.equal(
+      repeatedHandoff[0].payload.reason,
+      "repeated_failure_fingerprint",
+    );
+    const rateLimited = await queued("Recover from a retryable provider error");
+    let rateStep = 0;
+    const rateAgent = new Agent(
+      c.projects,
+      c.deployments,
+      {
+        async complete() {
+          if (rateStep++ === 0)
+            throw new AppError(502, "LLM_RATE_LIMITED", "rate limited");
+          if (rateStep === 2) return call("createPreview", {});
+          return { role: "assistant", content: "Recovered provider" };
+        },
+      },
+      { maxSwitches: 1 },
+    );
+    await rateAgent.run(rateLimited);
+    assert.equal(
+      (await rateAgent.get(rateLimited, user.id)).status,
+      "succeeded",
+    );
+    assert.equal(
+      (
+        await c.db.query<{ payload: { reason: string } }>(
+          "SELECT payload FROM job_events WHERE job_id=$1 AND type='agent_switch'",
+          [rateLimited],
+        )
+      ).rows[0].payload.reason,
+      "provider_error",
+    );
+    const badCredentials = await queued(
+      "Do not switch when provider credentials are invalid",
+    );
+    const authAgent = new Agent(
+      c.projects,
+      c.deployments,
+      {
+        async complete() {
+          throw new AppError(502, "LLM_AUTH_FAILED", "bad credentials");
+        },
+      },
+      { maxSwitches: 1 },
+    );
+    await authAgent.run(badCredentials);
+    assert.equal(
+      (await authAgent.get(badCredentials, user.id)).status,
+      "failed",
+    );
+    assert.equal(
+      (
+        await c.db.query<{ count: number }>(
+          "SELECT count(*)::integer AS count FROM job_events WHERE job_id=$1 AND type='agent_switch'",
+          [badCredentials],
+        )
+      ).rows[0].count,
+      0,
+    );
     const third = await queued(
       "Write actual custom source without executing it",
     );

@@ -83,7 +83,10 @@ type Job = {
   error: string | null;
   project_id: string | null;
   created_at: string;
-  result?: { summary?: string };
+  result?: { summary?: string; switchCount?: number; currentAgent?: string };
+  agent_attempt?: number;
+  switch_count?: number;
+  current_agent?: string;
 };
 type Deployment = {
   id: string;
@@ -779,6 +782,12 @@ function JobDetail({ id }: { id: string }) {
         <Badge status={data.job.status} />
       </div>
       <p className="requirement">{data.job.input}</p>
+      {(data.job.switch_count ?? 0) > 0 && (
+        <Notice kind="info">
+          {t("Agent 已自动接管")} · {data.job.current_agent} · {t("切换次数")}{" "}
+          {data.job.switch_count}
+        </Notice>
+      )}
       {data.job.error && (
         <Notice kind="info">
           {data.job.error === "LLM_UNCONFIGURED"
@@ -830,9 +839,11 @@ function JobDetail({ id }: { id: string }) {
                       ? `执行结果 · ${event.payload.name}`
                       : event.type === "requested"
                         ? t("需求已保存")
-                        : event.type === "assistant"
-                          ? "Agent"
-                          : t("执行异常")}
+                        : event.type === "agent_switch"
+                          ? t("Agent 自动接管")
+                          : event.type === "assistant"
+                            ? "Agent"
+                            : t("执行异常")}
                 </strong>
                 <time>{formatDate(event.created_at)}</time>
               </div>
@@ -1311,7 +1322,10 @@ function EnvironmentSettings({ id }: { id: string }) {
   );
 }
 function AppRuntimePanel() {
-  const deployments = useLoad<{ items: Deployment[] }>("/api/deployments", 4000);
+  const deployments = useLoad<{ items: Deployment[] }>(
+    "/api/deployments",
+    4000,
+  );
   const action = useAction();
   const [message, setMessage] = useState("");
   const live = (deployments.data?.items ?? []).filter(
@@ -1412,7 +1426,10 @@ function AppRuntimePanel() {
                     disabled={action.busy}
                     title={d.status === "running" ? t("已运行") : t("启动应用")}
                     onClick={() =>
-                      void act(d.id, d.status === "running" ? "restart" : "start")
+                      void act(
+                        d.id,
+                        d.status === "running" ? "restart" : "start",
+                      )
                     }
                   >
                     {d.status === "running" ? (
